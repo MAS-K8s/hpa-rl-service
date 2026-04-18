@@ -4,3 +4,4 @@ redis
 flask
 matplotlib
 pandas
+flask-cors

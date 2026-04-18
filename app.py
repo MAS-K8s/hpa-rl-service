@@ -204,14 +204,6 @@ def get_or_create_agent(deployment_name, namespace="default"):
                 except Exception as e:
                     logger.warning(f"⚠️ Could not load model: {e}")
             else:
-                # BUG FIX: Without pre-training, the network starts with random
-                # weights.  On a 3-action softmax this means ~33% per action and
-                # entropy ≈ log(3) = 1.099, giving confidence = 1 - 1.099/1.099 ≈ 0%.
-                # The Go controller's CONFIDENCE_MIN=0.05 then blocks almost every
-                # action, so the agent never scales and never collects real rewards
-                # to learn from.  Pre-train on synthetic data first so the policy
-                # starts with a reasonable prior (scale_up when stressed, etc.)
-                # before the first real request arrives.
                 logger.info(f"🏋️  No saved model found — running synthetic pre-training for {agent_key}")
                 agent.pretrain(n_steps=500)
                 agent.save_model(model_path)
@@ -236,20 +228,6 @@ def health():
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    """
-    Main prediction endpoint.
-
-    FIX (critical): In the old code, reward was calculated from prev_action,
-    then the final action could be overridden to no_action by the multi-agent
-    coordinator, but the experience stored still recorded the pre-coordination
-    action. This meant the buffer accumulated mismatched (action, reward) pairs.
-
-    Fix: compute reward using the PREVIOUS step's data (correct), then decide
-    the final action for THIS step (including coordination override), and ONLY
-    store the final decided action alongside the current state. The reward stored
-    for the previous step is based on what actually happened — the previous
-    step's final action — not what the policy naively chose.
-    """
     try:
         data = request.json
         deployment_name = data.get('deployment_name')
@@ -368,11 +346,7 @@ def predict():
 
         # Guard 2: soft replica cap — suppress scale_up when already at many
         # replicas AND latency hasn't improved. This catches the vish/stress
-        # scenario where the workload is always CPU-bound regardless of replicas,
-        # so the agent keeps getting rewarded for scale_up even at 8+ pods.
-        # The Go controller has a hard MAX_REPLICAS=10 env var, but catching it
-        # here gives better reward signal (the agent sees it as a no-op + penalty
-        # rather than just silently clamped by the controller).
+       
         elif action == 2:
             latency_now = metrics.get('latency_p95', 0.0)
             SOFT_CAP = int(os.getenv("SOFT_REPLICA_CAP", "5"))
@@ -397,9 +371,7 @@ def predict():
                 action = 1
                 action_name = "no_action"
 
-        # ── Step 5: Store THIS step's final decided action ───────────
-        # We store the FINAL action (post-coordination) so that next iteration's
-        # reward is computed against what actually happened.
+        # Step 5: Store THIS step's final decided action ───────────
         experience_store.set_last(
             agent_key,
             current_state,

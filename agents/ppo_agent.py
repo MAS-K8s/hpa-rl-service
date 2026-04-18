@@ -13,32 +13,6 @@ def action_to_string(action):
     return ACTION_MAP.get(action, "unknown")
 
 
-# ---------------------------------------------------------------------------
-# PPO — fixed for this environment
-#
-# Root causes of previous failures and fixes applied here:
-#
-# 1. REWARD SCALE: rewards of -145 caused value loss explosions (175,000+).
-#    Fix: RunningNormaliser clips rewards to [-3, +3] before storing.
-#    The actor sees normalised advantages; raw rewards are logged for humans.
-#
-# 2. COLD START / LOW CONFIDENCE: random weights → all 3 action probs ~33%
-#    → entropy = log(3) = 1.099 → confidence ≈ 0%.
-#    Fix: _rule_prior fires BEFORE the neural net for obvious cases, giving
-#    correct decisions and 60-90% confidence from request #1 with zero training.
-#
-# 3. SAMPLE EFFICIENCY: old batch_size=8 trained every 8 steps (~4 min).
-#    Fix: online PPO — store one transition per step, train immediately on a
-#    rolling window of the last 32 transitions. No waiting.
-#
-# 4. VALUE LOSS EXPLOSION: c1=0.5 + lr=3e-4 with high-variance rewards.
-#    Fix: c1=0.1, lr=1e-4, epochs=2. Gentle updates while critic calibrates.
-#
-# 5. CPU METRIC MISUNDERSTANDING: Prometheus returns fractional cores (~0.02),
-#    not percentage. All stress thresholds now use LATENCY as primary signal.
-# ---------------------------------------------------------------------------
-
-
 class RunningNormaliser:
     """Online reward normaliser — keeps rewards in a stable range."""
     def __init__(self, alpha=0.05):
@@ -338,8 +312,7 @@ class PPOAgent:
 
     def pretrain(self, n_steps=300):
         """
-        Fast supervised-style pretrain on synthetic data matching real
-        Prometheus metric ranges (cpu ~0.02, latency 0.10-1.20).
+        Fast supervised-style pretrain on synthetic data matching real Prometheus metric ranges (cpu ~0.02, latency 0.10-1.20).
         Target: <5 seconds, confidence >60% after completion.
         """
         logger.info(f"🏋️  Starting PPO pre-training for {n_steps} steps...")
@@ -456,15 +429,7 @@ class PPOAgent:
     # ── Internal helpers ───────────────────────────────────────────────────
 
     def _rule_prior(self, state):
-        """
-        Hard-coded rules that fire before the neural net.
-        Returns action int (0/1/2) or None (→ neural net decides).
-
-        State indices:
-          4  = latency_p95
-          6  = replicas / 10
-         17  = latency_p95 - sla_target  (violation magnitude)
-        """
+       
         latency  = float(state[4])
         replicas = round(float(state[6]) * 10)
         violation= float(state[17])

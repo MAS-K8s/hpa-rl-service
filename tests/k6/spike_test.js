@@ -29,7 +29,7 @@ export const options = {
   },
 };
 
-const BASE_URL = __ENV.BASE_URL || 'http://localhost:5000';
+const BASE_URL = __ENV.BASE_URL || 'https://rl-agent.dev-sachin.co.uk';
 
 export default function () {
   const res = http.post(

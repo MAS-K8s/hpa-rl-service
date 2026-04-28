@@ -9,7 +9,7 @@
  *
  * Run:
  *   k6 run k6/predict_load_test.js
- *   k6 run -e BASE_URL=http://your-service:5000 k6/predict_load_test.js
+ *   k6 run -e BASE_URL=https://rl-agent.dev-sachin.co.uk k6/predict_load_test.js
  */
 
 import http from 'k6/http';
@@ -34,7 +34,7 @@ export const options = {
   },
 };
 
-const BASE_URL = __ENV.BASE_URL || 'http://localhost:5000';
+const BASE_URL = __ENV.BASE_URL || 'https://rl-agent.dev-sachin.co.uk';
 
 const DEPLOYMENTS = ['app-a', 'app-b', 'app-c'];
 

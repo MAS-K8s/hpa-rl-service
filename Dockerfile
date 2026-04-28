@@ -27,20 +27,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates wget \
     && rm -rf /var/lib/apt/lists/*
 
+# Create non-root user FIRST so subsequent COPYs can use --chown
+RUN addgroup --gid 1000 appuser && \
+    adduser --disabled-password --uid 1000 --gid 1000 appuser
+
 WORKDIR /app
 
 # Copy installed packages from builder
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copy app code
-COPY . .
+# Copy app code with correct ownership from the start
+COPY --chown=appuser:appuser . .
 
-# Non-root user + permissions
+# Create models directory with correct ownership and permissive mode.
+# Mode 0775 (group-writable) helps when a host volume is mounted over it
+# with a different UID but a matching GID — common on k8s with fsGroup.
 RUN mkdir -p /app/models && \
-    addgroup --gid 1000 appuser && \
-    adduser --disabled-password --uid 1000 --gid 1000 appuser && \
-    chown -R appuser:appuser /app
+    chown -R appuser:appuser /app/models && \
+    chmod -R 0775 /app/models
+
+# Declare /app/models as a volume so it's clearly a writable mount point
+VOLUME ["/app/models"]
 
 USER appuser
 
@@ -48,7 +56,8 @@ EXPOSE 5000
 
 ENV FLASK_APP=app.py \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    MODEL_DIR=/app/models
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:5000/health || exit 1

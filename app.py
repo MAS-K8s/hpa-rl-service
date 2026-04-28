@@ -12,22 +12,40 @@ import numpy as np
 from threading import Lock
 import torch
 
+# Prometheus client for exporting metrics
+from prometheus_client import Counter, Gauge, generate_latest, REGISTRY
+
 from agents.ppo_agent import PPOAgent, action_to_string
 
 app = Flask(__name__)
 if _CORS_AVAILABLE:
     CORS(app, resources={r"/*": {"origins": "*"}})
+
+# Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO"),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# ======================== PROMETHEUS METRICS ========================
+
+ppo_actions = Counter('ppo_actions_total', 'Total actions taken by PPO agent', ['action', 'deployment'])
+ppo_reward = Gauge('ppo_last_reward', 'Last raw reward received', ['deployment'])
+ppo_confidence = Gauge('ppo_action_confidence', 'Confidence of chosen action', ['deployment'])
+ppo_value = Gauge('ppo_value_estimate', 'Value estimate from critic', ['deployment'])
+ppo_buffer_size = Gauge('ppo_buffer_size', 'Current buffer size', ['deployment'])
+ppo_training_steps = Gauge('ppo_training_steps', 'Number of training updates', ['deployment'])
+
+@app.route('/metrics', methods=['GET'])
+def metrics():
+    return generate_latest(REGISTRY), 200, {'Content-Type': 'text/plain'}
 
 # ======================== CONFIGURATION ========================
 
 STATE_SIZE = 18
 ACTION_SIZE = 3
-MODEL_DIR = "./models"
+MODEL_DIR = os.getenv("MODEL_DIR", "./models")
 CHECKPOINT_INTERVAL = 50
 
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -60,21 +78,18 @@ agents_lock = Lock()
 
 
 class ExperienceStore:
-    """Stores the most recent experience per agent for next-step reward calc."""
-
     def __init__(self):
         self.experiences = {}
         self.lock = Lock()
 
     def set_last(self, agent_key, state, action, log_prob, value, metrics):
-        """Store the current step so we can compute its reward next step."""
         with self.lock:
             self.experiences[agent_key] = {
                 'state': state,
                 'action': action,
                 'log_prob': log_prob,
                 'value': value,
-                'metrics': metrics,  # raw metrics at this step
+                'metrics': metrics,
                 'timestamp': datetime.now().isoformat()
             }
 
@@ -90,15 +105,11 @@ class ExperienceStore:
 experience_store = ExperienceStore()
 
 
-# ======================== DECISION HISTORY (for UI) ========================
-
 class DecisionHistory:
-    """Ring buffer: last 50 decisions per agent for the UI live feed."""
-
     MAX = 50
 
     def __init__(self):
-        self.history = {}   # agent_key -> list of dicts
+        self.history = {}
         self.lock = Lock()
 
     def push(self, agent_key, entry):
@@ -123,6 +134,8 @@ class MultiAgentCoordinator:
     def __init__(self, redis_client=None):
         self.redis_client = redis_client
         self.enabled = redis_client is not None
+        # Make cluster capacity configurable via environment variable
+        self.cluster_capacity = int(os.getenv("CLUSTER_CAPACITY", "50"))
 
     def publish_agent_state(self, agent_key, state_info):
         if not self.enabled:
@@ -138,23 +151,26 @@ class MultiAgentCoordinator:
 
     def get_cluster_status(self):
         if not self.enabled:
-            return {'total_agents': len(agents), 'total_replicas': 0, 'available_capacity': 100}
+            return {'total_agents': len(agents), 'total_replicas': 0, 'available_capacity': self.cluster_capacity}
         try:
             agent_keys = self.redis_client.keys("agent_state:*")
-            total_replicas = sum(
-                json.loads(self.redis_client.get(k) or b'{}').get('replicas', 0)
-                for k in agent_keys
-                if self.redis_client.get(k)
-            )
-            cluster_capacity = 50
+            total_replicas = 0
+            for k in agent_keys:
+                data = self.redis_client.get(k)
+                if data:
+                    try:
+                        parsed = json.loads(data)
+                        total_replicas += parsed.get('replicas', 0)
+                    except:
+                        pass
             return {
                 'total_agents': len(agent_keys),
                 'total_replicas': total_replicas,
-                'available_capacity': max(0, cluster_capacity - total_replicas)
+                'available_capacity': max(0, self.cluster_capacity - total_replicas)
             }
         except Exception as e:
             logger.warning(f"Failed to get cluster status: {e}")
-            return {'total_agents': 0, 'total_replicas': 0, 'available_capacity': 100}
+            return {'total_agents': 0, 'total_replicas': 0, 'available_capacity': self.cluster_capacity}
 
     def request_scaling_approval(self, agent_key, current_replicas, desired_replicas):
         if not self.enabled:
@@ -204,7 +220,7 @@ def get_or_create_agent(deployment_name, namespace="default"):
                 except Exception as e:
                     logger.warning(f"⚠️ Could not load model: {e}")
             else:
-                logger.info(f"🏋️  No saved model found — running synthetic pre-training for {agent_key}")
+                logger.info(f"🏋️ No saved model found — running synthetic pre-training for {agent_key}")
                 agent.pretrain(n_steps=500)
                 agent.save_model(model_path)
                 logger.info(f"✅ Pre-training complete and model saved for {agent_key}")
@@ -238,8 +254,7 @@ def predict():
         if not deployment_name:
             return jsonify({"success": False, "error": "deployment_name required"}), 400
 
-        # Handle warmup probe from Go controller startup (warmupRL function).
-        # Return a valid response immediately without creating an agent object.
+        # Warmup probe
         if deployment_name == "__warmup__":
             logger.info("🔥 Warmup probe received — PyTorch is ready")
             return jsonify({
@@ -260,26 +275,23 @@ def predict():
         agent = get_or_create_agent(deployment_name, namespace)
         agent_key = f"{namespace}/{deployment_name}"
 
-        # ── Step 1: Get current state ────────────────────────────────
+        # Step 1: Get current state
         current_state = agent.get_state(metrics)
 
-        # ── Step 2: Compute reward for PREVIOUS step and train ───────
+        # Step 2: Compute reward for PREVIOUS step and train
         reward = 0.0
         train_stats = None
         last_exp = experience_store.get_last(agent_key)
 
         if training_mode and last_exp is not None:
-            # Reward is: given that last step took last_exp['action'],
-            # and we now observe `metrics` as the result, how good was it?
             reward = agent.calculate_reward(
                 metrics,
-                last_exp['action'],  # the FINAL action that was actually taken
-                last_exp['metrics']  # the state at the time of that action
+                last_exp['action'],
+                last_exp['metrics']
             )
-
             agent.store_transition(
                 last_exp['state'],
-                last_exp['action'],  # final decided action (post-coordination)
+                last_exp['action'],
                 reward,
                 current_state,
                 done=False,
@@ -298,21 +310,20 @@ def predict():
                         f"Avg Reward: {train_stats['avg_reward']:.2f} | "
                         f"Entropy: {train_stats['entropy']:.3f}"
                     )
-                    # Store training step for UI chart
                     decision_history.push(agent_key + "/__training__", {
-                        "timestamp":    datetime.now().isoformat(),
-                        "step":         train_stats["training_steps"],
-                        "policy_loss":  round(float(train_stats["policy_loss"]), 6),
-                        "value_loss":   round(float(train_stats["value_loss"]), 4),
-                        "avg_reward":   round(float(train_stats["avg_reward"]), 4),
-                        "entropy":      round(float(train_stats["entropy"]), 4),
+                        "timestamp": datetime.now().isoformat(),
+                        "step": train_stats["training_steps"],
+                        "policy_loss": round(float(train_stats["policy_loss"]), 6),
+                        "value_loss": round(float(train_stats["value_loss"]), 4),
+                        "avg_reward": round(float(train_stats["avg_reward"]), 4),
+                        "entropy": round(float(train_stats["entropy"]), 4),
                     })
                     if train_stats['training_steps'] % CHECKPOINT_INTERVAL == 0:
                         model_path = os.path.join(MODEL_DIR, f"{agent_key.replace('/', '_')}.pt")
                         agent.save_model(model_path)
                         logger.info(f"💾 Checkpoint saved at step {train_stats['training_steps']}")
 
-        # ── Step 3: Select action for THIS step ──────────────────────
+        # Step 3: Select action for THIS step
         if training_mode:
             action, log_prob, value = agent.select_action(current_state, deterministic=False)
         else:
@@ -321,7 +332,15 @@ def predict():
         action_name = action_to_string(action)
         confidence, action_probs = agent.calculate_confidence(current_state)
 
-        # ── Step 4: Multi-agent coordination check ───────────────────
+        # Update Prometheus metrics (export)
+        ppo_actions.labels(action=action_name, deployment=agent_key).inc()
+        ppo_reward.labels(deployment=agent_key).set(reward if reward is not None else 0.0)
+        ppo_confidence.labels(deployment=agent_key).set(confidence)
+        ppo_value.labels(deployment=agent_key).set(value)
+        ppo_buffer_size.labels(deployment=agent_key).set(len(agent.buffer))
+        ppo_training_steps.labels(deployment=agent_key).set(agent.training_steps)
+
+        # Step 4: Multi-agent coordination & safety guards
         current_replicas = metrics.get('replicas', 1)
         desired_replicas = current_replicas
 
@@ -339,14 +358,9 @@ def predict():
             action_name = "no_action"
             desired_replicas = current_replicas
             coordination_message = "already at min replicas (1), scale-down suppressed"
-            logger.info(
-                f"🛡️  Min-replica guard | Agent: {agent_key} | "
-                f"scale_down suppressed at replicas={current_replicas}"
-            )
+            logger.info(f"🛡️ Min-replica guard | Agent: {agent_key} | scale_down suppressed")
 
-        # Guard 2: soft replica cap — suppress scale_up when already at many
-        # replicas AND latency hasn't improved. This catches the vish/stress
-       
+        # Guard 2: soft replica cap
         elif action == 2:
             latency_now = metrics.get('latency_p95', 0.0)
             SOFT_CAP = int(os.getenv("SOFT_REPLICA_CAP", "5"))
@@ -358,9 +372,7 @@ def predict():
                     f"soft replica cap ({SOFT_CAP}) reached with no latency improvement "
                     f"(latency={latency_now:.2f}s > SLA=0.5s) — scale_up suppressed"
                 )
-                logger.info(
-                    f"🧢 Soft-cap guard | Agent: {agent_key} | {coordination_message}"
-                )
+                logger.info(f"🧢 Soft-cap guard | Agent: {agent_key} | {coordination_message}")
 
         if desired_replicas != current_replicas and action != 1:
             coordination_approved, coordination_message = coordinator.request_scaling_approval(
@@ -371,11 +383,11 @@ def predict():
                 action = 1
                 action_name = "no_action"
 
-        # Step 5: Store THIS step's final decided action ───────────
+        # Step 5: Store THIS step's final decided action
         experience_store.set_last(
             agent_key,
             current_state,
-            action,        # final action after coordination override
+            action,
             log_prob,
             value,
             metrics
@@ -415,16 +427,15 @@ def predict():
             f"Buffer: {len(agent.buffer)}/{agent.batch_size}"
         )
 
-        # Push to UI decision history ring buffer
         decision_history.push(agent_key, {
-            "timestamp":      datetime.now().isoformat(),
-            "action":         action_name,
-            "action_id":      action,
-            "reward":         round(reward, 4),
-            "confidence":     round(float(confidence), 6),
+            "timestamp": datetime.now().isoformat(),
+            "action": action_name,
+            "action_id": action,
+            "reward": round(reward, 4),
+            "confidence": round(float(confidence), 6),
             "value_estimate": round(float(value), 4),
-            "replicas":       int(metrics.get("replicas", 0)),
-            "buffer_size":    len(agent.buffer),
+            "replicas": int(metrics.get("replicas", 0)),
+            "buffer_size": len(agent.buffer),
             "training_steps": agent.training_steps,
         })
 
@@ -477,15 +488,6 @@ def get_stats():
 
 @app.route('/pretrain', methods=['POST'])
 def pretrain():
-    """
-    Kick off synthetic pre-training for a specific agent (or all agents).
-
-    Body (JSON):
-      deployment_name  – required unless all_agents=true
-      namespace        – optional, default "default"
-      n_steps          – optional, default 500
-      all_agents       – optional bool, pre-train every active agent
-    """
     try:
         data = request.json or {}
         n_steps = int(data.get('n_steps', 500))
@@ -505,7 +507,7 @@ def pretrain():
         results = {}
         for agent in targets:
             agent_key = f"{agent.namespace}/{agent.deployment_name}"
-            logger.info(f"🏋️  Pre-training {agent_key} for {n_steps} steps")
+            logger.info(f"🏋️ Pre-training {agent_key} for {n_steps} steps")
             train_calls = agent.pretrain(n_steps=n_steps)
             model_path = os.path.join(MODEL_DIR, f"{agent_key.replace('/', '_')}.pt")
             agent.save_model(model_path)
@@ -525,7 +527,6 @@ def pretrain():
 
 @app.route('/reset_agent', methods=['POST'])
 def reset_agent():
-    """Reset a single agent and delete its saved model."""
     try:
         data = request.json
         agent_key = f"{data.get('namespace', 'default')}/{data.get('deployment_name')}"
@@ -537,13 +538,13 @@ def reset_agent():
             model_path = os.path.join(MODEL_DIR, f"{agent_key.replace('/', '_')}.pt")
             if os.path.exists(model_path):
                 os.remove(model_path)
-                logger.info(f"🗑️  Deleted model file: {model_path}")
+                logger.info(f"🗑️ Deleted model file: {model_path}")
             if REDIS_AVAILABLE:
                 try:
                     redis_client.delete(f"agent_state:{agent_key}")
                 except Exception as e:
                     logger.warning(f"Failed to clear Redis: {e}")
-            logger.info(f"♻️  Agent reset: {agent_key}")
+            logger.info(f"♻️ Agent reset: {agent_key}")
             return jsonify({"status": "agent_reset", "agent_key": agent_key})
     except Exception as e:
         logger.error(f"❌ Error resetting agent: {e}")
@@ -552,17 +553,11 @@ def reset_agent():
 
 @app.route('/reset_all', methods=['POST'])
 def reset_all():
-    """
-    Reset ALL agents and delete all saved models.
-    Call this after fixing the cpu='total' Prometheus bug so the agent
-    starts learning from clean, correct data instead of poisoned weights.
-    """
     with agents_lock:
         count = len(agents)
         agents.clear()
         with experience_store.lock:
             experience_store.experiences.clear()
-        # Delete all model files
         deleted = []
         for fname in os.listdir(MODEL_DIR):
             if fname.endswith('.pt'):
@@ -575,7 +570,7 @@ def reset_all():
                     redis_client.delete(key)
             except Exception as e:
                 logger.warning(f"Failed to clear Redis: {e}")
-        logger.info(f"♻️  All {count} agents reset, deleted {len(deleted)} model files")
+        logger.info(f"♻️ All {count} agents reset, deleted {len(deleted)} model files")
         return jsonify({
             "status": "all_reset",
             "agents_cleared": count,
@@ -606,36 +601,27 @@ def cluster_status():
         return jsonify({"error": str(e)}), 500
 
 
-# ======================== DASHBOARD (read-only, UI polling) ========================
-
 @app.route('/dashboard', methods=['GET'])
 def dashboard():
-    """
-    Read-only snapshot for the Angular UI dashboard.
-    Combines experience_store (last action/metrics/value per agent) with
-    agent training stats. Safe to poll frequently — no side effects.
-    """
     try:
         result = {}
 
         for agent_key, agent in agents.items():
             exp = experience_store.get_last(agent_key)
             metrics_snapshot = exp['metrics'] if exp else {}
-            last_action_id   = exp['action']  if exp else 1   # default no_action
-            value_estimate   = float(exp['value']) if exp else 0.0
-            timestamp        = exp['timestamp'] if exp else None
+            last_action_id = exp['action'] if exp else 1
+            value_estimate = float(exp['value']) if exp else 0.0
+            timestamp = exp['timestamp'] if exp else None
 
             action_name = action_to_string(last_action_id)
 
-            # Recalculate confidence + action probs from current policy
-            # (read-only — does not modify any state)
-            confidence    = 0.0
-            action_probs  = [0.333, 0.334, 0.333]
+            confidence = 0.0
+            action_probs = [0.333, 0.334, 0.333]
             if exp is not None:
                 try:
                     state = exp['state']
                     conf, probs = agent.calculate_confidence(state)
-                    confidence   = float(conf)
+                    confidence = float(conf)
                     action_probs = [float(p) for p in probs]
                 except Exception:
                     pass
@@ -643,42 +629,33 @@ def dashboard():
             training = agent.get_metrics()
 
             result[agent_key] = {
-                # last decision made by this agent
-                "last_action":          action_name,
-                "last_action_id":       last_action_id,
-                "confidence":           confidence,
+                "last_action": action_name,
+                "last_action_id": last_action_id,
+                "confidence": confidence,
                 "action_probabilities": action_probs,
-                "value_estimate":       value_estimate,
-                "last_decision_ts":     timestamp,
-
-                # live k8s metrics from the most recent /predict call
-                "replicas":     metrics_snapshot.get('replicas',    0),
-                "pod_ready":    metrics_snapshot.get('pod_ready',   0),
-                "pod_pending":  metrics_snapshot.get('pod_pending', 0),
-                "cpu_usage":    metrics_snapshot.get('cpu_usage',   0.0),
-                "memory_gib":   metrics_snapshot.get('memory_usage',0.0),
-                "request_rate": metrics_snapshot.get('request_rate',0.0),
-                "latency_p95":  metrics_snapshot.get('latency_p95', 0.0),
-                "error_rate":   metrics_snapshot.get('error_rate',  0.0),
-
-                # PPO training stats
+                "value_estimate": value_estimate,
+                "last_decision_ts": timestamp,
+                "replicas": metrics_snapshot.get('replicas', 0),
+                "pod_ready": metrics_snapshot.get('pod_ready', 0),
+                "pod_pending": metrics_snapshot.get('pod_pending', 0),
+                "cpu_usage": metrics_snapshot.get('cpu_usage', 0.0),
+                "memory_gib": metrics_snapshot.get('memory_usage', 0.0),
+                "request_rate": metrics_snapshot.get('request_rate', 0.0),
+                "latency_p95": metrics_snapshot.get('latency_p95', 0.0),
+                "error_rate": metrics_snapshot.get('error_rate', 0.0),
                 "training_steps": training['training_steps'],
                 "avg_reward_100": float(training['avg_reward_100']),
-                "buffer_size":    training['buffer_size'],
-                "device":         training['device'],
-
-                # live decision history (last 50 decisions)
+                "buffer_size": training['buffer_size'],
+                "device": training['device'],
                 "decision_history": decision_history.get(agent_key),
-
-                # training step history (last 50 steps) for charts
                 "training_history": decision_history.get(agent_key + "/__training__"),
             }
 
         return jsonify({
-            "agents":          result,
-            "total_agents":    len(agents),
+            "agents": result,
+            "total_agents": len(agents),
             "redis_available": REDIS_AVAILABLE,
-            "timestamp":       datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat()
         })
 
     except Exception as e:
@@ -690,7 +667,7 @@ def dashboard():
 
 if __name__ == '__main__':
     logger.info("=" * 60)
-    logger.info("🚀 Starting Advanced RL Agent API Service")
+    logger.info("🚀 Starting Advanced RL Agent API Service (Enhanced)")
     logger.info("=" * 60)
     logger.info(f"📁 Models directory: {MODEL_DIR}")
     logger.info(f"🔌 Redis: {REDIS_HOST}:{REDIS_PORT} ({'✅ Connected' if REDIS_AVAILABLE else '❌ Unavailable'})")
@@ -698,6 +675,7 @@ if __name__ == '__main__':
     logger.info(f"📊 State size: {STATE_SIZE} dimensions")
     logger.info(f"🎯 Action size: {ACTION_SIZE} actions")
     logger.info(f"🔄 Multi-agent coordination: {'✅ Enabled' if REDIS_AVAILABLE else '❌ Disabled'}")
+    logger.info(f"📈 Prometheus metrics available at /metrics")
     logger.info("=" * 60)
 
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HPA-RL Dashboard</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f5f5f5;
+      color: #222;
+      font-size: 14px;
+    }
+
+    header {
+      background: #fff;
+      border-bottom: 1px solid #ddd;
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    header h1 { font-size: 16px; font-weight: 600; }
+    header span { font-size: 12px; color: #888; }
+
+    main { padding: 24px; max-width: 1100px; margin: 0 auto; }
+
+    /* Summary row */
+    .summary {
+      display: flex;
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .summary-card {
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 16px 20px;
+      flex: 1;
+    }
+
+    .summary-card .label { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+    .summary-card .value { font-size: 24px; font-weight: 700; }
+
+    /* Agent cards */
+    .agent-card {
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      margin-bottom: 16px;
+      overflow: hidden;
+    }
+
+    .agent-header {
+      padding: 12px 20px;
+      border-bottom: 1px solid #eee;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: #fafafa;
+    }
+
+    .agent-name { font-weight: 600; font-size: 14px; }
+
+    .badge {
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .badge.scale_up   { background: #e6f9f0; color: #1a7a4a; }
+    .badge.scale_down { background: #fdecea; color: #c0392b; }
+    .badge.no_action  { background: #fff8e1; color: #b7860b; }
+
+    .agent-body {
+      padding: 16px 20px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+    }
+
+    .section-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 10px;
+    }
+
+    /* Metric grid */
+    .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+    .metric {
+      background: #f9f9f9;
+      border: 1px solid #eee;
+      border-radius: 6px;
+      padding: 10px 12px;
+    }
+
+    .metric .m-label { font-size: 11px; color: #888; margin-bottom: 2px; }
+    .metric .m-val   { font-size: 18px; font-weight: 700; }
+
+    /* Bars */
+    .bar-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+
+    .bar-row:last-child { margin-bottom: 0; }
+
+    .bar-name  { width: 80px; font-size: 12px; color: #555; flex-shrink: 0; }
+    .bar-track { flex: 1; height: 8px; background: #eee; border-radius: 4px; overflow: hidden; }
+    .bar-fill  { height: 100%; border-radius: 4px; transition: width 0.4s ease; }
+
+    .bar-fill.scale_up   { background: #2ecc71; }
+    .bar-fill.scale_down { background: #e74c3c; }
+    .bar-fill.no_action  { background: #f39c12; }
+
+    .bar-pct { width: 36px; text-align: right; font-size: 12px; color: #555; flex-shrink: 0; }
+
+    /* Log table */
+    .log-wrap {
+      grid-column: 1 / -1;
+      border-top: 1px solid #eee;
+      padding-top: 16px;
+    }
+
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th { text-align: left; color: #888; font-weight: 600; font-size: 11px; padding: 4px 8px; border-bottom: 1px solid #eee; }
+    td { padding: 6px 8px; border-bottom: 1px solid #f2f2f2; color: #444; }
+    tr:last-child td { border-bottom: none; }
+
+    .action-cell.scale_up   { color: #1a7a4a; font-weight: 600; }
+    .action-cell.scale_down { color: #c0392b; font-weight: 600; }
+    .action-cell.no_action  { color: #b7860b; font-weight: 600; }
+
+    /* Empty / error */
+    .empty {
+      text-align: center;
+      padding: 48px 20px;
+      color: #aaa;
+    }
+
+    .empty p { margin-top: 8px; font-size: 13px; }
+    .empty code { background: #f0f0f0; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+
+    #error-msg {
+      display: none;
+      background: #fdecea;
+      color: #c0392b;
+      padding: 10px 16px;
+      border-radius: 6px;
+      margin-bottom: 16px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>HPA-RL Agent Dashboard</h1>
+  <span id="updated">—</span>
+</header>
+
+<main>
+  <div id="error-msg">⚠ Could not reach /dashboard — retrying…</div>
+
+  <!-- Summary -->
+  <div class="summary">
+    <div class="summary-card">
+      <div class="label">Active Agents</div>
+      <div class="value" id="s-agents">—</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">Total Replicas</div>
+      <div class="value" id="s-replicas">—</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">Available Capacity</div>
+      <div class="value" id="s-capacity">—</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">Redis</div>
+      <div class="value" id="s-redis" style="font-size:16px">—</div>
+    </div>
+  </div>
+
+  <!-- Agent list -->
+  <div id="agents-list"></div>
+</main>
+
+<script>
+  function cls(name) { return (name || 'no_action').toLowerCase().replace(' ', '_'); }
+  function pct(n)    { return ((n || 0) * 100).toFixed(1) + '%'; }
+  function fix(n, d) { return n != null ? Number(n).toFixed(d) : '—'; }
+  function ts(iso)   { return iso ? new Date(iso).toLocaleTimeString() : '—'; }
+
+  function renderAgent(key, a) {
+    const ac = cls(a.last_action);
+    const probs = a.action_probabilities || [0.333, 0.334, 0.333];
+    const labels = ['scale_down', 'no_action', 'scale_up'];
+
+    const bars = labels.map((lbl, i) => `
+      <div class="bar-row">
+        <span class="bar-name">${lbl}</span>
+        <div class="bar-track"><div class="bar-fill ${lbl}" style="width:${(probs[i]*100).toFixed(1)}%"></div></div>
+        <span class="bar-pct">${(probs[i]*100).toFixed(1)}%</span>
+      </div>`).join('');
+
+    const hist = (a.decision_history || []).slice().reverse().slice(0, 8);
+    const rows = hist.length
+      ? hist.map(h => `
+          <tr>
+            <td>${ts(h.timestamp)}</td>
+            <td class="action-cell ${cls(h.action)}">${h.action || '—'}</td>
+            <td>${fix(h.reward, 3)}</td>
+            <td>${fix((h.confidence||0)*100, 1)}%</td>
+            <td>${h.replicas ?? '—'}</td>
+          </tr>`).join('')
+      : '<tr><td colspan="5" style="color:#aaa;text-align:center">No decisions yet</td></tr>';
+
+    return `
+      <div class="agent-card">
+        <div class="agent-header">
+          <span class="agent-name">${key}</span>
+          <span class="badge ${ac}">${a.last_action || '—'}</span>
+        </div>
+        <div class="agent-body">
+
+          <div>
+            <div class="section-title">Metrics</div>
+            <div class="metrics">
+              <div class="metric"><div class="m-label">Replicas</div><div class="m-val">${a.replicas ?? '—'}</div></div>
+              <div class="metric"><div class="m-label">CPU %</div><div class="m-val">${fix(a.cpu_usage, 1)}</div></div>
+              <div class="metric"><div class="m-label">Latency p95</div><div class="m-val">${fix(a.latency_p95, 3)}s</div></div>
+              <div class="metric"><div class="m-label">Error Rate</div><div class="m-val">${fix((a.error_rate||0)*100, 2)}%</div></div>
+            </div>
+          </div>
+
+          <div>
+            <div class="section-title">Action Probabilities · Confidence ${pct(a.confidence)}</div>
+            ${bars}
+            <div style="margin-top:14px">
+              <div class="section-title">Training</div>
+              <div style="display:flex;gap:20px;font-size:13px;color:#444">
+                <span>Steps: <strong>${a.training_steps ?? '—'}</strong></span>
+                <span>Avg Reward: <strong>${fix(a.avg_reward_100, 3)}</strong></span>
+                <span>Buffer: <strong>${a.buffer_size ?? '—'}</strong></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="log-wrap">
+            <div class="section-title">Decision History</div>
+            <table>
+              <thead><tr><th>Time</th><th>Action</th><th>Reward</th><th>Confidence</th><th>Replicas</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+
+        </div>
+      </div>`;
+  }
+
+  async function refresh() {
+    try {
+      const res  = await fetch('/dashboard');
+      if (!res.ok) throw new Error();
+      const data = await res.json();
+
+      document.getElementById('error-msg').style.display = 'none';
+      document.getElementById('s-agents').textContent   = data.total_agents ?? '—';
+      document.getElementById('s-replicas').textContent = (data.cluster_status || {}).total_replicas ?? '—';
+      document.getElementById('s-capacity').textContent = (data.cluster_status || {}).available_capacity ?? '—';
+      document.getElementById('s-redis').textContent    = data.redis_available ? '✅ Connected' : '❌ Off';
+      document.getElementById('updated').textContent    = 'Updated ' + new Date().toLocaleTimeString();
+
+      const agents = data.agents || {};
+      const list   = document.getElementById('agents-list');
+
+      if (!Object.keys(agents).length) {
+        list.innerHTML = `
+          <div class="empty">
+            <strong>No agents yet</strong>
+            <p>Send a <code>POST /predict</code> with a <code>deployment_name</code> to create one.</p>
+          </div>`;
+        return;
+      }
+
+      list.innerHTML = Object.entries(agents)
+        .map(([k, a]) => renderAgent(k, a))
+        .join('');
+
+    } catch {
+      document.getElementById('error-msg').style.display = 'block';
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 5000);
+</script>
+</body>
+</html>

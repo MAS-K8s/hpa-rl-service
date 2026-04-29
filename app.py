@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 try:
     from flask_cors import CORS
     _CORS_AVAILABLE = True
@@ -229,6 +229,11 @@ def get_or_create_agent(deployment_name, namespace="default"):
 
 
 # ======================== API ENDPOINTS ========================
+
+@app.route('/', methods=['GET'])
+def index():
+    return render_template('index.html')
+
 
 @app.route('/health', methods=['GET'])
 def health():

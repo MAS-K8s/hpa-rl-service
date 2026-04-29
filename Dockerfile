@@ -1,19 +1,14 @@
 # ---------- Builder stage ----------
 FROM python:3.10-slim AS builder
 
-# Build deps (some python libs may need compiling)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy requirements
 COPY requirements.txt .
 
-# Install dependencies
-# 1) Install everything except torch from PyPI
-# 2) Install torch CPU wheels from PyTorch index
 RUN pip install --no-cache-dir --upgrade pip && \
     grep -ivE '^\s*torch\s*$' requirements.txt > requirements-notorch.txt && \
     pip install --no-cache-dir -r requirements-notorch.txt && \
@@ -22,7 +17,6 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # ---------- Final stage ----------
 FROM python:3.10-slim
 
-# Runtime deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates wget \
     && rm -rf /var/lib/apt/lists/*
@@ -33,22 +27,19 @@ RUN addgroup --gid 1000 appuser && \
 
 WORKDIR /app
 
-# Copy installed packages from builder
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copy app code with correct ownership from the start
+# Copy app code with correct ownership
 COPY --chown=appuser:appuser . .
 
-# Create models directory with correct ownership and permissive mode.
-# Mode 0775 (group-writable) helps when a host volume is mounted over it
-# with a different UID but a matching GID — common on k8s with fsGroup.
-RUN mkdir -p /app/models && \
-    chown -R appuser:appuser /app/models && \
-    chmod -R 0775 /app/models
-
-# Declare /app/models as a volume so it's clearly a writable mount point
-VOLUME ["/app/models"]
+# Wipe any models/ baked in from the build context and recreate it
+# clean. The PVC will mount over this at runtime; perms set here
+# are the fallback for when the pod runs without a volume mount.
+RUN rm -rf /app/models && \
+    mkdir -p /app/models && \
+    chown -R appuser:appuser /app && \
+    chmod -R g+rwX /app/models
 
 USER appuser
 

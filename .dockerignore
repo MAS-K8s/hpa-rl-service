@@ -1,0 +1,31 @@
+# Python
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+
+# Virtualenvs
+.hpa-rl-service-env
+venv
+.venv
+
+# Local config that must NOT enter the image
+.env
+.env.*
+
+# Local model files — let the PVC handle this in k8s
+models/*
+!models/.gitkeep
+
+# Git / CI
+.git
+.gitignore
+.github
+
+# Tests not needed at runtime
+tests
+
+# Editor/OS junk
+.vscode
+.idea
+.DS_Store
